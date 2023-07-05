@@ -1,6 +1,21 @@
 -- mod-version:3
--- Highlights changed lines, if file is in a git repository.
--- Also supports MiniMap, if user has it installed and activated.
+--[[
+	gitdiff_highlight/init.lua
+	Highlights changed lines, if file is in a git repository.
+	- Also supports [minimap], if user has it installed and activated.
+	- Can replace [gitstatus], at least to some extent:
+		- [gitstatus] scans the entire tree while this plugin only acts on
+			loaded/saved files
+		- [gitstatus] does not detect changes in repositories in subdirectories
+			that aren't registered as submodules
+		- [gitstatus] shows inserts and deletes of entire project in status view
+			while this plugin shows the changes of current file
+	- Note: colouring the treeview will follow real directory path and not symlinks
+	version: 20230705.1323 by SwissalpS
+	original [gitdiff_highlight] by github.com/vincens2005
+	original [gitstatus] by github.com/rxi ?
+	license: MIT
+--]]
 local core = require "core"
 local config = require "core.config"
 local DocView = require "core.docview"
@@ -10,10 +25,38 @@ local command = require "core.command"
 local style = require "core.style"
 local gitdiff = require "plugins.gitdiff_highlight.gitdiff"
 
+config.plugins.gitdiff_highlight = common.merge({
+  use_status = true,
+  use_treeview = false,
+  -- The config specification used by the settings gui
+  config_spec = {
+    name = "Git Diff Highlight",
+    {
+      label = "Show Info in Status View",
+      description = "You may not want this if you also use [gitstatus]."
+					.. "\n(Relaunch needed)",
+      path = "use_status",
+      type = "toggle",
+      default = true
+    },
+    {
+      label = "Colour Items in Tree View",
+      description = "You may not want this if you also use [gitstatus]."
+					.. "\n(Relaunch needed)",
+      path = "use_treeview",
+      type = "toggle",
+      default = false
+    }
+  }
+}, config.plugins.gitdiff_highlight)
+
 -- vscode defaults
 style.gitdiff_addition = style.gitdiff_addition or { common.color "#587c0c" }
 style.gitdiff_modification = style.gitdiff_modification or { common.color "#0c7d9d" }
 style.gitdiff_deletion = style.gitdiff_deletion or { common.color "#94151b" }
+
+-- in case TreeView is being used, holds alternative item colours
+local cached_color_for_item = {}
 
 local function color_for_diff(diff)
 	if diff == "addition" then
@@ -81,6 +124,52 @@ local function update_diff(doc)
 		coroutine.yield(0.1)
 	end
 	diffs[doc] = gitdiff.changed_lines(diff_proc:read_stdout(max_diff_size))
+	-- get branch name
+	local branch_proc = process.start({
+		"git", "-C", path, "rev-parse", "--abbrev-ref", "HEAD"
+	})
+	while branch_proc:running() do
+		coroutine.yield(0.1)
+	end
+  diffs[doc].branch = (branch_proc:read_stdout() or ""):match("[^\n]*")
+	-- get insert/delete statistics
+	local inserts, deletes = 0, 0
+  local nums_proc = process.start({
+		"git", "-C", path, "diff", "--numstat"
+  })
+	while nums_proc:running() do
+		coroutine.yield(0.1)
+	end
+	local numstat = nums_proc:read_stdout() or ""
+	local ins, dels, p, abs_path
+	for line in string.gmatch(numstat, "[^\n]+") do
+		ins, dels, p = line:match("(%d+)%s+(%d+)%s+(.+)")
+		-- not a 100% fool-proof check if this stat is about this file,
+		-- should be good enough though
+		if p and full_path:match(p .. "$") then
+			inserts = inserts + (tonumber(ins) or 0)
+			deletes = deletes + (tonumber(dels) or 0)
+			if 0 == inserts and 0 == deletes then
+				cached_color_for_item[full_path] = nil
+				-- since this plugin avoids scanning entire trees,
+				-- we can't reliably check if we can clear treeview colours for
+				-- parent folders. We could scan cached_color_for_item to check on
+				-- neighbour files that have been opened, but at this time SwissalpS
+				-- doesn't consider that good enough and not worth the effort. Time
+				-- would be better spent to implement a way to scan the entire tree like
+				-- [gitstatus] does, but also find repos in subdirectories.
+			else
+				abs_path = full_path
+				-- Color this file, and each parent folder. Too simple to not do it.
+				while abs_path do
+					cached_color_for_item[abs_path] = style.gitdiff_modification
+					abs_path = common.dirname(abs_path)
+				end
+			end
+		end
+	end
+	diffs[doc].inserts = inserts
+	diffs[doc].deletes = deletes
 	diffs[doc].is_in_repo = true
 end
 
@@ -164,6 +253,58 @@ function Doc:load(...)
 		update_diff(self)
 	end)
 end
+
+-- add status bar info after all plugins have loaded
+core.add_thread(function()
+	if not config.plugins.gitdiff_highlight.use_status
+		or not core.status_view
+	then return end
+
+	local StatusView = require "core.statusview"
+	core.status_view:add_item({
+		name = "gitdiff_highlight:status",
+		alignment = StatusView.Item.RIGHT,
+		get_item = function()
+			if not core.active_view:is(DocView) then return {} end
+
+			local t = get_diff(core.active_view.doc)
+			if not t.is_in_repo then return {} end
+
+			return {
+				(t.inserts ~= 0 or t.deletes ~= 0) and style.accent or style.text,
+				t.branch,
+				style.dim, "  ",
+				t.inserts ~= 0 and style.accent or style.text, "+", t.inserts,
+				style.dim, " / ",
+				t.deletes ~= 0 and style.accent or style.text, "-", t.deletes,
+			}
+			--]]
+		end,
+		position = -1,
+		tooltip = "branch and changes",
+		separator = core.status_view.separator2
+	})
+end)
+
+-- add treeview info after all plugins have loaded
+core.add_thread(function()
+	if not config.plugins.gitdiff_highlight.use_treeview
+		or false == config.plugins.treeview
+	then return end
+
+	-- abort if TreeView isn't installed
+	local found, TreeView = pcall(require, "plugins.treeview")
+	if not found then return end
+
+	local treeview_get_item_text = TreeView.get_item_text
+	function TreeView:get_item_text(item, active, hovered)
+		local text, font, color = treeview_get_item_text(self, item, active, hovered)
+		if cached_color_for_item[item.abs_filename] then
+			color = cached_color_for_item[item.abs_filename]
+		end
+		return text, font, color
+	end
+end)
 
 -- add minimap support only after all plugins are loaded
 core.add_thread(function()
